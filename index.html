@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Script Library | 技術スクリプト集</title>
+<style>
+:root{font-family:system-ui,-apple-system,"Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif;color:#e7edf7;background:#0b1220}*{box-sizing:border-box}body{margin:0}header{border-bottom:1px solid #26344c;background:#101b2c}.wrap{max-width:1080px;margin:auto;padding:0 22px}.top{padding:42px 0 35px}.eyebrow{color:#67d9c1;letter-spacing:.15em;font-size:12px;font-weight:bold}h1{font-size:clamp(30px,5vw,50px);margin:8px 0}header p{color:#a7b7cd;line-height:1.8;max-width:740px}.controls{display:flex;gap:12px;flex-wrap:wrap;padding:25px 0 18px}input{flex:1;min-width:210px;border-radius:10px;border:1px solid #38506a;padding:13px 15px;background:#132238;color:#fff;font:inherit}input:focus{outline:2px solid #67d9c1}.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:22px}button{cursor:pointer;font:inherit} .chip{border:1px solid #3a5068;color:#c8d8ea;border-radius:40px;background:transparent;padding:8px 14px}.chip.active{background:#67d9c1;border-color:#67d9c1;color:#0a2030;font-weight:700}#count{color:#9aacc2;margin:10px 0 18px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,440px),1fr));gap:18px;padding-bottom:80px}.card{border:1px solid #2a3d55;border-radius:16px;padding:22px;background:#142137;min-width:0}.card h2{font-size:19px;margin:13px 0 9px}.desc{color:#b1c1d7;line-height:1.7;font-size:14px}.tag{font-size:12px;border:1px solid #38516e;border-radius:30px;padding:4px 10px;color:#7ce7d1}.note{color:#f7cc89;font-size:13px;line-height:1.6}pre{background:#07101e;border-radius:9px;overflow:auto;padding:15px;color:#d9e6f4;font-size:12.5px;line-height:1.7}code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.copy{background:#213c58;border:1px solid #476384;border-radius:8px;color:#fff;padding:9px 14px}.copy:hover{background:#2c526d}.bottom{display:flex;justify-content:space-between;align-items:center;gap:12px}footer{color:#7289a4;font-size:12px;text-align:center;padding:25px;border-top:1px solid #26344c}#empty{color:#b1c1d7;padding:20px 0;display:none}
+</style>
+</head>
+<body>
+<header><div class="wrap top"><div class="eyebrow">CODE / AUTOMATION / NOTES</div><h1>Script Library<span style="color:#67d9c1">.</span></h1><p>PowerShell、Python、Cisco、Tera Termなどの便利なスクリプトや技術メモをまとめています。必要なコードを探してコピーできます。</p></div></header>
+<main class="wrap"><div class="controls"><input id="search" type="search" placeholder="スクリプト名・内容を検索…" aria-label="スクリプトを検索"></div><div class="chips" id="filters"></div><div id="count"></div><div id="empty">該当するスクリプトがありません。</div><div class="grid" id="cards"></div></main>
+<footer>Script Library · GitHub Pages</footer>
+<script>
+// ===== ここに公開したいスクリプトを追加してください =====
+const scripts = [
+  {
+    title: 'CSVファイルの一覧を表示',
+    category: 'PowerShell',
+    description: 'カレントフォルダ内のCSVファイル名を一覧表示する、読み取り専用の例です。',
+    note: '表示のみでファイルは変更しません。',
+    code: 'Get-ChildItem -Path . -Filter "*.csv" -File | Select-Object Name'
+  },
+  {
+    title: 'フォルダ内のTXTを列挙',
+    category: 'Python',
+    description: 'Python標準ライブラリで現在のフォルダにあるTXTファイル名を表示します。',
+    note: 'Python 3.x用のサンプルです。',
+    code: 'from pathlib import Path\n\nfor path in Path(".").glob("*.txt"):\n    print(path.name)'
+  },
+  {
+    title: 'IPインターフェース状態の確認',
+    category: 'Cisco',
+    description: 'Cisco IOS XEのインターフェースのIPアドレスと稼働状態を確認します。',
+    note: '装置のソフトウェアや権限によって実行可否が異なります。',
+    code: 'show ip interface brief'
+  },
+  {
+    title: 'Tera Term接続先のホスト名取得',
+    category: 'Tera Term',
+    description: 'Tera Termマクロで接続先のホスト名を変数へ取得する例です。',
+    note: '接続状態とTera Termのバージョンを確認してください。',
+    code: 'gethostname host_name\nmessagebox host_name "接続先"'
+  }
+];
+// ===== 編集エリアはここまで =====
+const search = document.getElementById('search');
+const filters = document.getElementById('filters');
+const cards = document.getElementById('cards');
+let active = 'すべて';
+const categories = ['すべて', ...new Set(scripts.map(x => x.category))];
+function el(tag, className, text){const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=text;return node;}
+function renderFilters(){filters.replaceChildren();for(const cat of categories){const b=el('button','chip'+(cat===active?' active':''),cat);b.type='button';b.addEventListener('click',()=>{active=cat;renderFilters();renderCards();});filters.append(b);}}
+function renderCards(){const q=search.value.toLocaleLowerCase().trim();const found=scripts.filter(s=>(active==='すべて'||s.category===active)&&[s.title,s.category,s.description,s.note,s.code].join(' ').toLocaleLowerCase().includes(q));cards.replaceChildren();document.getElementById('count').textContent=`${found.length} 件のスクリプト`;document.getElementById('empty').style.display=found.length?'none':'block';for(const s of found){const card=el('article','card');card.append(el('span','tag',s.category),el('h2','',s.title),el('p','desc',s.description));const pre=el('pre');const code=el('code','',s.code);pre.append(code);card.append(pre);const bottom=el('div','bottom');bottom.append(el('span','note',s.note));const copy=el('button','copy','コピー');copy.type='button';copy.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(s.code);copy.textContent='コピーしました';setTimeout(()=>{copy.textContent='コピー'},1800)}catch(err){copy.textContent='コピーできません';}});bottom.append(copy);card.append(bottom);cards.append(card);}}
+search.addEventListener('input',renderCards);renderFilters();renderCards();
+</script>
+</body></html>
