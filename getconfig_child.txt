@@ -1,0 +1,338 @@
+; ============================================================
+;  getconfig_child.ttl
+;  Processes one host: login -> commands -> save log -> exit
+;
+;  Normally launched by start.bat (GUI) or getconfig_start.ttl
+;  with the host number. If you run this file directly,
+;  it asks the host number (for test).
+;
+;  ASCII only (no Japanese) to avoid encoding problems.
+; ============================================================
+
+; ---------------- settings ----------------
+LIST_FILE     = 'List.txt'
+LOG_DIR       = 'log'
+LOGIN_TIMEOUT = 60      ; login wait (sec)  CUCM CLI start is slow
+SETTLE_SEC    = 3       ; wait until login messages stop (sec)
+CMD_TIMEOUT   = 300     ; wait for each command (sec)
+EXIT_CMD      = 'exit'
+
+; prompt = (name)(end char)   end char: >  #  $  %  ]  :
+;   ex.  R1#   R1>   user@sv01:~$   admin:
+PROMPT_REGEX  = '([A-Za-z0-9_.:/()@~\-]+)([>#$%\]:])'
+
+; default commands (used when column 8 of List.txt is empty)
+CMD_MAX = 50
+strdim CMDS CMD_MAX
+CMD_COUNT = 2
+CMDS[0] = 'show myself'
+CMDS[1] = 'show running-config'
+
+; 1 = show the reason in a message box when a host fails
+; 0 = close silently
+DEBUG = 1
+; ------------------------------------------
+
+host    = '(unknown)'
+ip      = ''
+reason  = ''
+
+getdir basedir
+
+; ---- argument (host number in List.txt) ----
+targetno = 0
+strlen param2
+if result > 0 then
+  str2int targetno param2
+endif
+if targetno <= 0 then
+  inputbox 'Host number in List.txt (comment/blank lines are not counted)' 'TEST' '1'
+  str2int targetno inputstr
+  if result = 0 end
+  if targetno <= 0 end
+endif
+
+; ---- paths and folders ----
+makepath listpath basedir LIST_FILE
+getdate today '%Y%m%d'
+makepath logroot basedir LOG_DIR
+foldersearch logroot
+if result = 0 foldercreate logroot
+makepath logdir logroot today
+foldersearch logdir
+if result = 0 foldercreate logdir
+
+; ---- read target line from List.txt ----
+fileopen fh listpath 0 1
+if fh = -1 then
+  reason = 'cannot open List.txt'
+  goto FINISH
+endif
+
+cnt = 0
+found = 0
+while 1
+  filereadln fh line
+  eof = result
+  strtrim line ' '#9
+  strlen line
+  if result > 0 then
+    strmatch line '^[^A-Za-z0-9,]*#'
+    if result = 0 then
+      cnt = cnt + 1
+      if cnt = targetno then
+        found = 1
+        break
+      endif
+    endif
+  endif
+  if eof = 1 break
+endwhile
+fileclose fh
+if found = 0 then
+  sprintf2 reason 'host #%d not in List.txt' targetno
+  goto FINISH
+endif
+
+; format: hostname,ip,method,user,password,enable_password,port,command_file
+strsplit line ',' 8
+host    = groupmatchstr1
+ip      = groupmatchstr2
+method  = groupmatchstr3
+user    = groupmatchstr4
+pass    = groupmatchstr5
+enpass  = groupmatchstr6
+port    = groupmatchstr7
+cmdfile = groupmatchstr8
+strtrim host    ' '#9
+strtrim ip      ' '#9
+strtrim method  ' '#9
+strtrim user    ' '#9
+strtrim pass    ' '#9
+strtrim enpass  ' '#9
+strtrim port    ' '#9
+strtrim cmdfile ' '#9
+
+strlen host
+if result = 0 then
+  reason = 'hostname is empty'
+  goto FINISH
+endif
+strlen ip
+if result = 0 then
+  reason = 'ip is empty'
+  goto FINISH
+endif
+strlen user
+if result = 0 then
+  reason = 'user is empty'
+  goto FINISH
+endif
+
+; method: 1=SSH 2=CR(challenge, auto) 3=CRM(challenge, manual) 4=TELNET
+mcode = 0
+strmatch method '^[Ss][Ss][Hh]$'
+if result > 0 mcode = 1
+strmatch method '^[Cc][Rr]$'
+if result > 0 mcode = 2
+strmatch method '^[Cc][Rr][Mm]$'
+if result > 0 mcode = 3
+strmatch method '^[Tt][Ee][Ll][Nn][Ee][Tt]$'
+if result > 0 mcode = 4
+if mcode = 0 then
+  sprintf2 reason 'invalid method (%s)' method
+  goto FINISH
+endif
+
+strlen port
+if result = 0 then
+  if mcode = 4 then
+    port = '23'
+  else
+    port = '22'
+  endif
+endif
+
+; ---- command file (column 8) ----
+strlen cmdfile
+if result > 0 then
+  makepath cmdpath basedir cmdfile
+  fileopen cf cmdpath 0 1
+  if cf = -1 then
+    sprintf2 reason 'command file not found (%s)' cmdfile
+    goto FINISH
+  endif
+  CMD_COUNT = 0
+  while 1
+    filereadln cf cl
+    ceof = result
+    strtrim cl ' '#9
+    strlen cl
+    if result > 0 then
+      strmatch cl '^[^A-Za-z0-9,]*#'
+      if result = 0 then
+        if CMD_COUNT < CMD_MAX then
+          CMDS[CMD_COUNT] = cl
+          CMD_COUNT = CMD_COUNT + 1
+        endif
+      endif
+    endif
+    if ceof = 1 break
+  endwhile
+  fileclose cf
+  if CMD_COUNT = 0 then
+    sprintf2 reason 'no command in %s' cmdfile
+    goto FINISH
+  endif
+endif
+
+; ---- log file name: hostname_YYYYMMDD_HHMMSS.log ----
+gettime ts '%H%M%S'
+sprintf2 logname '%s_%s_%s.log' host today ts
+makepath logpath logdir logname
+
+; ---- connect ----
+if mcode = 1 then
+  sprintf2 cmd '%s:%s /ssh /2 /auth=password /user=%s /passwd=%s /nosecuritywarning' ip port user pass
+elseif mcode = 2 then
+  sprintf2 cmd '%s:%s /ssh /2 /auth=challenge /user=%s /passwd=%s /nosecuritywarning' ip port user pass
+elseif mcode = 3 then
+  sprintf2 cmd '%s:%s /ssh /2 /auth=challenge /user=%s /nosecuritywarning' ip port user
+else
+  sprintf2 cmd '%s:%s /nossh /T=1' ip port
+endif
+
+connect cmd
+if result <> 2 then
+  reason = 'connect failed'
+  goto FINISH
+endif
+
+settitle host
+logopen logpath 0 0 1 0 1
+
+; ---- telnet login ----
+if mcode = 4 then
+  timeout = LOGIN_TIMEOUT
+  wait 'sername:' 'ogin:'
+  if result = 0 then
+    reason = 'no username prompt (telnet)'
+    goto FINISH
+  endif
+  sendln user
+  wait 'assword:'
+  if result = 0 then
+    reason = 'no password prompt (telnet)'
+    goto FINISH
+  endif
+  sendln pass
+endif
+
+; ---- wait for login ----
+if mcode = 3 then
+  timeout = 180
+else
+  timeout = LOGIN_TIMEOUT
+endif
+wait '>' '#' '$' '%' ']' ':'
+if result = 0 then
+  reason = 'login prompt not found (login failed or timeout)'
+  goto FINISH
+endif
+
+; wait until login messages (banner etc.) stop
+timeout = SETTLE_SEC
+for q 1 60
+  recvln
+  if result = 0 break
+next
+
+; ---- detect prompt ----
+;  send CR and read the prompt, then send CR again and confirm
+;  the same prompt appears (avoids mistaking banner text like "Version:")
+pfound = 0
+for t 1 6
+  flushrecv
+  sendln ''
+  timeout = 10
+  waitregex PROMPT_REGEX
+  if result > 0 then
+    pname = groupmatchstr1
+    pmark = groupmatchstr2
+    sprintf2 promptstr '%s%s' pname pmark
+    mpause 500
+    flushrecv
+    sendln ''
+    timeout = 5
+    wait promptstr
+    if result = 1 then
+      pfound = 1
+      break
+    endif
+  endif
+  pause 3
+next
+if pfound = 0 then
+  reason = 'prompt not detected after login'
+  goto FINISH
+endif
+
+; ---- enable only if prompt is ">" and enable password is set ----
+strcompare pmark '>'
+if result = 0 then
+  strlen enpass
+  if result > 0 then
+    sendln 'enable'
+    timeout = LOGIN_TIMEOUT
+    wait 'assword:'
+    if result = 0 then
+      reason = 'no enable password prompt'
+      goto FINISH
+    endif
+    sendln enpass
+    sprintf2 promptstr '%s#' pname
+    wait promptstr '% Access denied' '% Bad'
+    if result <> 1 then
+      reason = 'enable failed'
+      goto FINISH
+    endif
+  endif
+endif
+
+; ---- run commands ----
+timeout = CMD_TIMEOUT
+last = CMD_COUNT - 1
+for i 0 last
+  sendln CMDS[i]
+  wait promptstr
+  if result = 0 then
+    sprintf2 reason 'timeout waiting prompt [%s] after: %s' promptstr CMDS[i]
+    goto FINISH
+  endif
+next
+
+mpause 300
+logclose
+
+; ---- disconnect ----
+sendln EXIT_CMD
+for j 1 20
+  testlink
+  if result <> 2 break
+  mpause 500
+next
+
+:FINISH
+strlen reason
+if result > 0 then
+  if DEBUG = 1 then
+    sprintf2 msg 'Host: %s (%s)%s%s' host ip #13#10 reason
+    messagebox msg 'getconfig_child: FAILED'
+  endif
+endif
+testlink
+if result > 0 then
+  logclose
+  closett
+endif
+end
