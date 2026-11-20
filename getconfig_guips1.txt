@@ -1,0 +1,439 @@
+# ============================================================
+#  getconfig_gui.ps1
+#  GUI launcher for getconfig_child.ttl (Tera Term)
+#  -> Start with start.bat (double click)
+#  ASCII only to avoid encoding problems.
+# ============================================================
+
+# ---------------- settings ----------------
+$ListFile     = 'List.txt'
+$ChildMacro   = 'getconfig_child.ttl'
+$LogDirName   = 'log'
+$TtpMacroPath = ''     # full path of ttpmacro.exe (empty = auto detect)
+$IntervalSec  = 3      # default interval between launches (sec)
+$BatchSize    = 10     # rest after this many launches (0 = off)
+$BatchWaitSec = 20     # rest time (sec)
+# ------------------------------------------
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+trap {
+  [void][System.Windows.Forms.MessageBox]::Show(($_ | Out-String), 'ERROR', 'OK', 'Error')
+  break
+}
+
+$BaseDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$script:running = $false
+
+function C($r, $g, $b) { return [System.Drawing.Color]::FromArgb($r, $g, $b) }
+
+$cNavy       = C 30 41 66
+$cAccent     = C 16 163 127
+$cAccentDark = C 12 128 100
+$cStop       = C 220 53 69
+$cDisabled   = C 176 186 198
+$cLight      = C 245 247 250
+$cBorder     = C 226 230 236
+$cText       = C 40 48 64
+$cGray       = C 120 130 145
+
+$fontMain  = New-Object System.Drawing.Font('Segoe UI', 10)
+$fontBold  = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+$fontTitle = New-Object System.Drawing.Font('Segoe UI', 17, [System.Drawing.FontStyle]::Bold)
+$fontSub   = New-Object System.Drawing.Font('Segoe UI', 9)
+$fontGo    = New-Object System.Drawing.Font('Segoe UI', 15, [System.Drawing.FontStyle]::Bold)
+
+function Show-Error($msg) {
+  [void][System.Windows.Forms.MessageBox]::Show($msg, 'ERROR', 'OK', 'Error')
+}
+
+# ---------------- find ttpmacro.exe ----------------
+function Find-TtpMacro {
+  if ($TtpMacroPath -and (Test-Path -LiteralPath $TtpMacroPath)) { return $TtpMacroPath }
+
+  $saved = Join-Path $BaseDir 'ttpmacro_path.txt'
+  if (Test-Path -LiteralPath $saved) {
+    $p = (Get-Content -LiteralPath $saved -TotalCount 1)
+    if ($p) { $p = $p.Trim() }
+    if ($p -and (Test-Path -LiteralPath $p)) { return $p }
+  }
+
+  try {
+    $progId = (Get-ItemProperty -LiteralPath 'Registry::HKEY_CLASSES_ROOT\.ttl' -ErrorAction Stop).'(default)'
+    if ($progId) {
+      $cmd = (Get-ItemProperty -LiteralPath "Registry::HKEY_CLASSES_ROOT\$progId\shell\open\command" -ErrorAction Stop).'(default)'
+      if ($cmd -match '([A-Za-z]:\\[^"]*?ttpmacro\.exe)') {
+        if (Test-Path -LiteralPath $Matches[1]) { return $Matches[1] }
+      }
+    }
+  } catch {}
+
+  $pf86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+  foreach ($root in @($env:ProgramFiles, $pf86)) {
+    if (-not $root) { continue }
+    foreach ($d in @('teraterm5', 'teraterm', 'Tera Term')) {
+      $c = Join-Path $root "$d\ttpmacro.exe"
+      if (Test-Path -LiteralPath $c) { return $c }
+    }
+  }
+
+  $dlg = New-Object System.Windows.Forms.OpenFileDialog
+  $dlg.Title  = 'Select ttpmacro.exe (in Tera Term folder)'
+  $dlg.Filter = 'ttpmacro.exe|ttpmacro.exe|All files|*.*'
+  if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    Set-Content -LiteralPath $saved -Value $dlg.FileName -Encoding Default
+    return $dlg.FileName
+  }
+  return $null
+}
+
+# ---------------- read List.txt ----------------
+function Get-Field($arr, $i) {
+  if ($arr.Count -gt $i) { return $arr[$i].Trim() } else { return '' }
+}
+
+function Load-List {
+  $path = Join-Path $BaseDir $ListFile
+  if (-not (Test-Path -LiteralPath $path)) { throw "List.txt not found:`r`n$path" }
+  $items = New-Object System.Collections.ArrayList
+  $no = 0
+  foreach ($raw in [System.IO.File]::ReadAllLines($path, [System.Text.Encoding]::Default)) {
+    $line = $raw.Trim()
+    if ($line.Length -eq 0) { continue }
+    if ($line -match '^[^A-Za-z0-9,]*#') { continue }   # comment line
+    $no++
+    $f = $line.Split(',')
+    $method = (Get-Field $f 2).ToUpper()
+    $port = Get-Field $f 6
+    if (-not $port) { if ($method -eq 'TELNET') { $port = '23' } else { $port = '22' } }
+    [void]$items.Add([pscustomobject]@{
+      No = $no; HostName = (Get-Field $f 0); IP = (Get-Field $f 1)
+      Method = $method; User = (Get-Field $f 3); Port = $port
+      CmdFile = $(if (Get-Field $f 7) { Get-Field $f 7 } else { '(default)' })
+    })
+  }
+  return ,$items
+}
+
+# ---------------- form ----------------
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'Tera Term Auto Log Collector'
+$form.Size = New-Object System.Drawing.Size(980, 620)
+$form.MinimumSize = New-Object System.Drawing.Size(820, 420)
+$form.StartPosition = 'CenterScreen'
+$form.Font = $fontMain
+$form.BackColor = [System.Drawing.Color]::White
+
+# header
+$header = New-Object System.Windows.Forms.Panel
+$header.Dock = 'Top'
+$header.Height = 76
+$header.BackColor = $cNavy
+
+$lblTitle = New-Object System.Windows.Forms.Label
+$lblTitle.Text = 'Auto Log Collector'
+$lblTitle.Font = $fontTitle
+$lblTitle.ForeColor = [System.Drawing.Color]::White
+$lblTitle.AutoSize = $true
+$lblTitle.Location = New-Object System.Drawing.Point(22, 10)
+$header.Controls.Add($lblTitle)
+
+$lblSub = New-Object System.Windows.Forms.Label
+$lblSub.Text = 'login  >  terminal length 0  >  show running-config  >  exit        List: ' + (Join-Path $BaseDir $ListFile)
+$lblSub.Font = $fontSub
+$lblSub.ForeColor = C 170 182 204
+$lblSub.AutoSize = $true
+$lblSub.Location = New-Object System.Drawing.Point(25, 48)
+$header.Controls.Add($lblSub)
+
+$lblCount = New-Object System.Windows.Forms.Label
+$lblCount.Font = $fontBold
+$lblCount.ForeColor = [System.Drawing.Color]::White
+$lblCount.AutoSize = $true
+$lblCount.Top = 20
+$header.Controls.Add($lblCount)
+$header.Add_Resize({ $lblCount.Left = $header.ClientSize.Width - $lblCount.Width - 26 })
+
+# grid
+$grid = New-Object System.Windows.Forms.DataGridView
+$grid.Dock = 'Fill'
+$grid.AllowUserToAddRows = $false
+$grid.AllowUserToDeleteRows = $false
+$grid.AllowUserToResizeRows = $false
+$grid.RowHeadersVisible = $false
+$grid.SelectionMode = 'FullRowSelect'
+$grid.AutoSizeColumnsMode = 'Fill'
+$grid.BackgroundColor = [System.Drawing.Color]::White
+$grid.BorderStyle = 'None'
+$grid.CellBorderStyle = 'SingleHorizontal'
+$grid.GridColor = $cBorder
+$grid.EnableHeadersVisualStyles = $false
+$grid.ColumnHeadersBorderStyle = 'None'
+$grid.ColumnHeadersHeightSizeMode = 'DisableResizing'
+$grid.ColumnHeadersHeight = 38
+$grid.ColumnHeadersDefaultCellStyle.BackColor = $cLight
+$grid.ColumnHeadersDefaultCellStyle.ForeColor = $cGray
+$grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = $cLight
+$grid.ColumnHeadersDefaultCellStyle.Font = $fontBold
+$grid.ColumnHeadersDefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(6, 0, 6, 0)
+$grid.RowTemplate.Height = 34
+$grid.DefaultCellStyle.ForeColor = $cText
+$grid.DefaultCellStyle.SelectionBackColor = C 224 243 237
+$grid.DefaultCellStyle.SelectionForeColor = $cText
+$grid.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(6, 0, 6, 0)
+$grid.AlternatingRowsDefaultCellStyle.BackColor = C 250 251 253
+
+$colSel = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+$colSel.Name = 'Sel'
+$colSel.HeaderText = ''
+$colSel.AutoSizeMode = 'None'
+$colSel.Width = 44
+[void]$grid.Columns.Add($colSel)
+
+function Add-TextCol($name, $text, $weight) {
+  $c = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+  $c.Name = $name
+  $c.HeaderText = $text
+  $c.ReadOnly = $true
+  $c.FillWeight = $weight
+  $c.SortMode = 'NotSortable'
+  [void]$grid.Columns.Add($c)
+}
+Add-TextCol 'No'       'No'         7
+Add-TextCol 'HostName' 'Hostname'   24
+Add-TextCol 'IP'       'IP Address' 20
+Add-TextCol 'Method'   'Method'     11
+Add-TextCol 'User'     'User'       14
+Add-TextCol 'Port'     'Port'       7
+Add-TextCol 'CmdFile'  'Commands'   16
+Add-TextCol 'Status'   'Status'     16
+
+# bottom bar
+$bottom = New-Object System.Windows.Forms.Panel
+$bottom.Dock = 'Bottom'
+$bottom.Height = 78
+$bottom.BackColor = $cLight
+
+$sep = New-Object System.Windows.Forms.Panel
+$sep.Dock = 'Top'
+$sep.Height = 1
+$sep.BackColor = $cBorder
+$bottom.Controls.Add($sep)
+
+function New-FlatButton($text, $x, $w) {
+  $b = New-Object System.Windows.Forms.Button
+  $b.Text = $text
+  $b.Location = New-Object System.Drawing.Point($x, 21)
+  $b.Size = New-Object System.Drawing.Size($w, 36)
+  $b.FlatStyle = 'Flat'
+  $b.FlatAppearance.BorderColor = $cBorder
+  $b.BackColor = [System.Drawing.Color]::White
+  $b.ForeColor = $cText
+  $b.Cursor = 'Hand'
+  $bottom.Controls.Add($b)
+  return $b
+}
+$btnAll    = New-FlatButton 'Select All'      20 104
+$btnNone   = New-FlatButton 'Clear'           132 80
+$btnReload = New-FlatButton 'Reload List'     220 114
+$btnLog    = New-FlatButton 'Open Log Folder' 342 146
+
+$lblInt = New-Object System.Windows.Forms.Label
+$lblInt.Text = 'Interval (sec)'
+$lblInt.ForeColor = $cGray
+$lblInt.AutoSize = $true
+$lblInt.Location = New-Object System.Drawing.Point(510, 29)
+$bottom.Controls.Add($lblInt)
+
+$numInt = New-Object System.Windows.Forms.NumericUpDown
+$numInt.Minimum = 1
+$numInt.Maximum = 60
+$numInt.Value = $IntervalSec
+$numInt.Width = 56
+$numInt.Location = New-Object System.Drawing.Point(610, 26)
+$bottom.Controls.Add($numInt)
+
+$btnGo = New-Object System.Windows.Forms.Button
+$btnGo.Text = 'GO'
+$btnGo.Font = $fontGo
+$btnGo.Size = New-Object System.Drawing.Size(160, 50)
+$btnGo.Top = 14
+$btnGo.FlatStyle = 'Flat'
+$btnGo.FlatAppearance.BorderSize = 0
+$btnGo.ForeColor = [System.Drawing.Color]::White
+$btnGo.BackColor = $cAccent
+$btnGo.Cursor = 'Hand'
+$bottom.Controls.Add($btnGo)
+$bottom.Add_Resize({ $btnGo.Left = $bottom.ClientSize.Width - $btnGo.Width - 24 })
+
+# status bar
+$status = New-Object System.Windows.Forms.StatusStrip
+$status.BackColor = [System.Drawing.Color]::White
+$status.SizingGrip = $false
+$lblStatus = New-Object System.Windows.Forms.ToolStripStatusLabel
+$lblStatus.ForeColor = $cGray
+$lblStatus.Text = 'Ready'
+[void]$status.Items.Add($lblStatus)
+
+# add order matters for docking
+$form.Controls.Add($grid)
+$form.Controls.Add($bottom)
+$form.Controls.Add($status)
+$form.Controls.Add($header)
+
+# ---------------- logic ----------------
+function Update-GoButton {
+  $n = 0
+  foreach ($r in $grid.Rows) { if ($r.Cells['Sel'].Value -eq $true) { $n++ } }
+  $lblCount.Text = "$n / $($grid.Rows.Count) selected"
+  $lblCount.Left = $header.ClientSize.Width - $lblCount.Width - 26
+  if ($script:running) {
+    $btnGo.Text = 'STOP'
+    $btnGo.Enabled = $true
+    $btnGo.BackColor = $cStop
+    $btnGo.FlatAppearance.MouseOverBackColor = C 190 40 55
+  } else {
+    $btnGo.Text = 'GO'
+    $btnGo.Enabled = ($n -gt 0)
+    if ($n -gt 0) { $btnGo.BackColor = $cAccent } else { $btnGo.BackColor = $cDisabled }
+    $btnGo.FlatAppearance.MouseOverBackColor = $cAccentDark
+  }
+}
+
+function Set-Running($on) {
+  $script:running = $on
+  $btnAll.Enabled = -not $on
+  $btnNone.Enabled = -not $on
+  $btnReload.Enabled = -not $on
+  $numInt.Enabled = -not $on
+  $colSel.ReadOnly = $on
+  Update-GoButton
+}
+
+function Fill-Grid {
+  $grid.Rows.Clear()
+  $items = @()
+  try { $items = Load-List } catch { Show-Error $_.Exception.Message }
+  foreach ($it in $items) {
+    $idx = $grid.Rows.Add($true, $it.No, $it.HostName, $it.IP, $it.Method, $it.User, $it.Port, $it.CmdFile, 'Ready')
+    $row = $grid.Rows[$idx]
+    $mc = $row.Cells['Method']
+    $mc.Style.Font = $fontBold
+    switch ($it.Method) {
+      'SSH'    { $mc.Style.ForeColor = C 37 99 235 }
+      'CR'     { $mc.Style.ForeColor = C 124 58 237 }
+      'CRM'    { $mc.Style.ForeColor = C 192 38 211 }
+      'TELNET' { $mc.Style.ForeColor = C 217 119 6 }
+      default  {
+        $mc.Style.ForeColor = $cStop
+        $row.Cells['Sel'].Value = $false
+        $row.Cells['Status'].Value = 'Invalid method'
+      }
+    }
+    $row.Cells['Status'].Style.ForeColor = $cGray
+    $row.Cells['CmdFile'].Style.ForeColor = $cGray
+    if ($it.CmdFile -ne '(default)' -and -not (Test-Path -LiteralPath (Join-Path $BaseDir $it.CmdFile))) {
+      $row.Cells['CmdFile'].Style.ForeColor = $cStop
+      $row.Cells['Status'].Value = 'Cmd file missing'
+    }
+  }
+  $grid.ClearSelection()
+  $lblStatus.Text = "Loaded $($grid.Rows.Count) host(s) from $ListFile"
+  Update-GoButton
+}
+
+$grid.Add_CurrentCellDirtyStateChanged({
+  if ($grid.IsCurrentCellDirty) { [void]$grid.CommitEdit([System.Windows.Forms.DataGridViewDataErrorContexts]::Commit) }
+})
+$grid.Add_CellValueChanged({ Update-GoButton })
+
+$btnAll.Add_Click({ foreach ($r in $grid.Rows) { $r.Cells['Sel'].Value = $true }; Update-GoButton })
+$btnNone.Add_Click({ foreach ($r in $grid.Rows) { $r.Cells['Sel'].Value = $false }; Update-GoButton })
+$btnReload.Add_Click({ Fill-Grid })
+$btnLog.Add_Click({
+  $p = Join-Path $BaseDir $LogDirName
+  New-Item -ItemType Directory -Force -Path $p | Out-Null
+  Start-Process explorer.exe -ArgumentList ('"{0}"' -f $p)
+})
+
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Add_Tick({
+  $timer.Stop()
+  if ($script:queue.Count -eq 0) {
+    Set-Running $false
+    $lblStatus.Text = "Done. $($script:launched) host(s) launched.   Log: $($script:logDir)"
+    return
+  }
+  $r = $script:queue.Dequeue()
+  $no = $r.Cells['No'].Value
+  try {
+    Start-Process -FilePath $script:ttp -ArgumentList ('/V "{0}" {1}' -f $script:child, $no)
+    $r.Cells['Status'].Value = 'Launched'
+    $r.Cells['Status'].Style.ForeColor = $cAccentDark
+    $r.Cells['Status'].Style.Font = $fontBold
+  } catch {
+    $r.Cells['Status'].Value = 'Launch error'
+    $r.Cells['Status'].Style.ForeColor = $cStop
+  }
+  $script:launched++
+  $grid.FirstDisplayedScrollingRowIndex = [Math]::Max(0, $r.Index - 3)
+
+  $wait = [int]$numInt.Value * 1000
+  $msg = "Launching...  $($script:launched) / $($script:total)"
+  if ($script:queue.Count -eq 0) {
+    $wait = 200
+  } elseif ($BatchSize -gt 0 -and ($script:launched % $BatchSize) -eq 0) {
+    $wait = $BatchWaitSec * 1000
+    $msg += "   (resting $BatchWaitSec sec)"
+  }
+  $lblStatus.Text = $msg
+  $timer.Interval = $wait
+  $timer.Start()
+})
+
+$btnGo.Add_Click({
+  if ($script:running) {
+    # STOP: cancel hosts not yet launched
+    foreach ($r in $script:queue) { $r.Cells['Status'].Value = 'Canceled' }
+    $script:queue.Clear()
+    $lblStatus.Text = 'Stopped. Windows already opened will continue.'
+    return
+  }
+
+  $ttp = Find-TtpMacro
+  if (-not $ttp) { return }
+  $child = Join-Path $BaseDir $ChildMacro
+  if (-not (Test-Path -LiteralPath $child)) { Show-Error "$ChildMacro not found:`r`n$child"; return }
+
+  $targets = @()
+  foreach ($r in $grid.Rows) { if ($r.Cells['Sel'].Value -eq $true) { $targets += $r } }
+  if ($targets.Count -eq 0) { return }
+
+  $ans = [System.Windows.Forms.MessageBox]::Show("Start log collection for $($targets.Count) host(s)?", 'CONFIRM', 'OKCancel', 'Question')
+  if ($ans -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+  $script:logDir = Join-Path (Join-Path $BaseDir $LogDirName) (Get-Date -Format 'yyyyMMdd')
+  New-Item -ItemType Directory -Force -Path $script:logDir | Out-Null
+
+  $script:ttp = $ttp
+  $script:child = $child
+  $script:queue = New-Object System.Collections.Queue
+  foreach ($r in $grid.Rows) {
+    if ($r.Cells['Sel'].Value -eq $true) {
+      $script:queue.Enqueue($r)
+      $r.Cells['Status'].Value = 'Waiting'
+      $r.Cells['Status'].Style.ForeColor = $cGray
+      $r.Cells['Status'].Style.Font = $fontMain
+    }
+  }
+  $script:total = $script:queue.Count
+  $script:launched = 0
+  Set-Running $true
+  $timer.Interval = 100
+  $timer.Start()
+})
+
+$form.Add_Shown({ Fill-Grid; $form.Activate() })
+[void]$form.ShowDialog()
