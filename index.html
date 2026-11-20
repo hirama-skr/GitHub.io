@@ -192,7 +192,7 @@ function renderCards() {
         status.textContent = 'コピーできませんでした。HTTPSの公開サイトで再度お試しください。';
       }
     });
-    toolbar.append(show, full, copy, download);
+    toolbar.append(show, full, copy);
     card.append(toolbar, status, pre, el('p', 'note', s.note));
     cards.append(card);
   }
