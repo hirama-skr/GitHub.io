@@ -1,0 +1,105 @@
+; ============================================================
+;  getconfig_start.ttl  (RUN THIS FILE)
+;
+;  Reads List.txt and launches one Tera Term per host.
+;  Each host is processed by getconfig_child.ttl:
+;    login -> terminal length 0 -> show running-config -> exit
+;
+;  ASCII only (no Japanese) to avoid encoding problems.
+; ============================================================
+
+; ---------------- settings ----------------
+LIST_FILE      = 'List.txt'
+CHILD_MACRO    = 'getconfig_child.ttl'
+LOG_DIR        = 'log'
+INTERVAL_MS    = 3000   ; interval between launches (msec)
+BATCH_SIZE     = 10     ; rest after launching this many hosts (0 = off)
+BATCH_WAIT_SEC = 20     ; rest time (sec)
+
+; ------------------------------------------
+
+getdir basedir
+
+makepath listpath  basedir LIST_FILE
+makepath childpath basedir CHILD_MACRO
+getttdir ttdir
+makepath ttpmacro ttdir 'ttpmacro.exe'
+
+filesearch childpath
+if result = 0 then
+  messagebox 'getconfig_child.ttl not found in the same folder.' 'ERROR'
+  end
+endif
+filesearch ttpmacro
+if result = 0 then
+  messagebox 'ttpmacro.exe not found.' 'ERROR'
+  end
+endif
+
+; ---- count hosts in List.txt ----
+fileopen fh listpath 0 1
+if fh = -1 then
+  messagebox 'Cannot open List.txt. Put it in the same folder as the macro.' 'ERROR'
+  end
+endif
+
+total = 0
+hostlist = ''
+while 1
+  filereadln fh line
+  eof = result
+  strtrim line ' '#9
+  strlen line
+  if result > 0 then
+    ; lines starting with # are comments
+    strmatch line '^[^A-Za-z0-9,]*#'
+    if result = 0 then
+      total = total + 1
+      strsplit line ',' 2
+      h = groupmatchstr1
+      strtrim h ' '#9
+      sprintf2 s '%3d: %s' total h
+      strconcat hostlist s
+      strconcat hostlist #13#10
+    endif
+  endif
+  if eof = 1 break
+endwhile
+fileclose fh
+
+if total = 0 then
+  messagebox 'No hosts in List.txt.' 'ERROR'
+  end
+endif
+
+; ---- create log folder (log\YYYYMMDD) ----
+getdate today '%Y%m%d'
+makepath logroot basedir LOG_DIR
+foldersearch logroot
+if result = 0 foldercreate logroot
+makepath logdir logroot today
+foldersearch logdir
+if result = 0 foldercreate logdir
+
+; ---- confirm ----
+sprintf2 msg 'Get logs from %d hosts. OK?' total
+strconcat msg #13#10#13#10
+strconcat msg hostlist
+yesnobox msg 'CONFIRM'
+if result = 0 end
+
+; ---- launch child macro for each host ----
+for i 1 total
+  sprintf2 cmd '"%s" /V "%s" %d' ttpmacro childpath i
+  exec cmd
+  if i < total then
+    mpause INTERVAL_MS
+    if BATCH_SIZE > 0 then
+      if i % BATCH_SIZE = 0 pause BATCH_WAIT_SEC
+    endif
+  endif
+next
+
+sprintf2 msg 'Launched %d hosts.%sLog folder: %s' total #13#10 logdir
+messagebox msg 'DONE'
+end
