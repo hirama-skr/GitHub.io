@@ -1,0 +1,497 @@
+#Requires -Version 5.1
+<#
+  CUCM 自動ログインツール（PowerShell 版）
+  - Python / 追加DLL 不要。Windows 標準の PowerShell 5.1 + WinForms で動作
+  - chromedriver.exe / geckodriver.exe と W3C WebDriver プロトコル(HTTP)で直接通信
+  - 設定は同じフォルダの clusters.ini（Python 版と同じ書式）
+  ※ このファイルを編集したら「UTF-8 (BOM付き)」で保存すること（BOM が無いと日本語が文字化けします）
+#>
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$ErrorActionPreference = 'Stop'
+$AppTitle   = 'CUCM 自動ログインツール'
+$script:BaseDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$ConfigFile = Join-Path $script:BaseDir 'clusters.ini'
+$ElemKey    = 'element-6066-11e4-a52e-4f735466cecf'
+$PwMask     = '●●●●●●●●'
+
+# localhost の Driver と直接通信するため、システムのプロキシを使わない
+[System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy
+[System.Net.ServicePointManager]::Expect100Continue = $false
+
+$script:Settings = $null
+$script:Drv      = $null   # @{ Browser; Proc; Base; Session }
+
+# ============================================================ 共通
+function Wait-UI([int]$Ms) {
+    # 画面を固まらせずに待つ
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $Ms) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 30
+    }
+}
+
+# ============================================================ 設定読込
+function Resolve-ToolPath([string]$P) {
+    if ([string]::IsNullOrWhiteSpace($P)) { return '' }
+    $P = [Environment]::ExpandEnvironmentVariables($P.Trim().Trim('"'))
+    if ([IO.Path]::IsPathRooted($P)) { return $P }
+    return [IO.Path]::Combine($script:BaseDir, $P)
+}
+
+function Get-Val($Table, [string]$Key, [string]$Default = '') {
+    if ($Table.ContainsKey($Key) -and $Table[$Key] -ne '') { return $Table[$Key] }
+    return $Default
+}
+
+function ConvertTo-Bool([string]$V, [bool]$Default) {
+    if ([string]::IsNullOrWhiteSpace($V)) { return $Default }
+    return @('true', 'yes', '1', 'on') -contains $V.Trim().ToLower()
+}
+
+function Read-Config([string]$Path) {
+    $sections = New-Object System.Collections.Specialized.OrderedDictionary
+    $cur = $null
+    foreach ($raw in (Get-Content -LiteralPath $Path -Encoding UTF8)) {
+        $line = $raw.Trim()
+        if ($line -eq '' -or $line.StartsWith(';') -or $line.StartsWith('#')) { continue }
+        if ($line -match '^\[(.+)\]$') {
+            $cur = $Matches[1].Trim()
+            if (-not $sections.Contains($cur)) { $sections[$cur] = @{} }
+            continue
+        }
+        $i = $line.IndexOf('=')
+        if ($i -gt 0 -and $cur) {
+            $sections[$cur][$line.Substring(0, $i).Trim().ToLower()] = $line.Substring($i + 1).Trim()
+        }
+    }
+
+    $s = @{}
+    $clusters = New-Object System.Collections.ArrayList
+    foreach ($name in $sections.Keys) {
+        $t = $sections[$name]
+        if ($name -ieq 'settings') { $s = $t; continue }
+        [void]$clusters.Add([pscustomobject]@{
+            Name      = Get-Val $t 'name' $name
+            Ip        = Get-Val $t 'ip'
+            User      = Get-Val $t 'user'
+            Password  = Get-Val $t 'password'
+            LoginPath = Get-Val $t 'login_path'
+            Checked   = ConvertTo-Bool (Get-Val $t 'default_checked') $false
+        })
+    }
+
+    $settings = [pscustomobject]@{
+        Browser       = (Get-Val $s 'browser' 'chrome').ToLower()
+        ChromeDriver  = Resolve-ToolPath (Get-Val $s 'chromedriver' 'chromedriver.exe')
+        ChromeBinary  = Resolve-ToolPath (Get-Val $s 'chrome_binary')
+        GeckoDriver   = Resolve-ToolPath (Get-Val $s 'geckodriver' 'geckodriver.exe')
+        FirefoxBinary = Resolve-ToolPath (Get-Val $s 'firefox_binary')
+        LoginPath     = Get-Val $s 'login_path' '/ccmadmin/showHome.do'
+        Timeout       = [int](Get-Val $s 'timeout' '20')
+        ShowPassword  = ConvertTo-Bool (Get-Val $s 'show_password') $true
+    }
+    return [pscustomobject]@{ Settings = $settings; Clusters = $clusters }
+}
+
+# ============================================================ WebDriver 通信
+function Invoke-WD {
+    param([string]$Method, [string]$Path, $Body = $null, [int]$TimeoutSec = 60)
+    $uri = $script:Drv.Base + $Path
+    try {
+        if ($Method -eq 'GET' -or $Method -eq 'DELETE') {
+            $r = Invoke-RestMethod -Method $Method -Uri $uri -TimeoutSec $TimeoutSec
+        } else {
+            if ($null -eq $Body) { $Body = @{} }
+            $json  = ConvertTo-Json -InputObject $Body -Depth 10 -Compress
+            $bytes = [Text.Encoding]::UTF8.GetBytes($json)   # 日本語や記号入りパスワード対策
+            $r = Invoke-RestMethod -Method $Method -Uri $uri -Body $bytes `
+                    -ContentType 'application/json; charset=utf-8' -TimeoutSec $TimeoutSec
+        }
+        return $r.value
+    } catch {
+        $detail = $null
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            try { $detail = ($_.ErrorDetails.Message | ConvertFrom-Json).value } catch { }
+        }
+        if ($detail -and $detail.error) {
+            throw ("WD[{0}] {1}" -f $detail.error, ($detail.message -split "`n")[0])
+        }
+        throw
+    }
+}
+
+function Get-SessPath { "/session/$($script:Drv.Session)" }
+
+function Find-Elements([string]$Css) {
+    $found = @(Invoke-WD POST "$(Get-SessPath)/elements" @{ using = 'css selector'; value = $Css })
+    foreach ($e in $found) { if ($e) { $e.$ElemKey } }
+}
+
+function Invoke-JS([string]$Code) {
+    Invoke-WD POST "$(Get-SessPath)/execute/sync" @{ script = $Code; args = @() }
+}
+
+function Get-FreePort {
+    $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $l.Start(); $p = $l.LocalEndpoint.Port; $l.Stop()
+    return $p
+}
+
+function Start-Driver($Settings) {
+    $isFx = $Settings.Browser -eq 'firefox'
+    $exe  = if ($isFx) { $Settings.GeckoDriver } else { $Settings.ChromeDriver }
+    $name = if ($isFx) { 'geckodriver.exe' } else { 'chromedriver.exe' }
+    if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        throw "$name が見つかりません: $exe"
+    }
+    $port    = Get-FreePort
+    $argList = if ($isFx) { "--port $port" } else { "--port=$port" }
+    try {
+        $proc = Start-Process -FilePath $exe -ArgumentList $argList -WindowStyle Hidden -PassThru
+    } catch {
+        throw "$name を実行できません（Windows 用 win64 版か確認してください）: $($_.Exception.Message)"
+    }
+    $script:Drv = @{ Browser = $Settings.Browser; Proc = $proc; Base = "http://127.0.0.1:$port"; Session = $null }
+
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt 15000) {
+        if ($proc.HasExited) { throw "$name が起動直後に終了しました（Windows 用 win64 版か確認してください）" }
+        try {
+            $st = Invoke-WD GET '/status' -TimeoutSec 2
+            if ($st.ready) { return }
+        } catch { }
+        Wait-UI 300
+    }
+    throw "$name の起動を確認できませんでした"
+}
+
+function Stop-Driver {
+    if ($script:Drv -and $script:Drv.Proc -and -not $script:Drv.Proc.HasExited) {
+        try { Stop-Process -Id $script:Drv.Proc.Id -Force } catch { }
+    }
+    $script:Drv = $null
+}
+
+function New-WDSession($Settings) {
+    if ($Settings.Browser -eq 'firefox') {
+        $caps = @{ browserName = 'firefox'; acceptInsecureCerts = $true; pageLoadStrategy = 'none' }
+        if ($Settings.FirefoxBinary) { $caps['moz:firefoxOptions'] = @{ binary = $Settings.FirefoxBinary } }
+    } else {
+        $opt = @{
+            args            = @('--ignore-certificate-errors', '--start-maximized')
+            detach          = $true                     # ツール終了後もブラウザを残す
+            excludeSwitches = @('enable-automation')
+        }
+        if ($Settings.ChromeBinary) { $opt['binary'] = $Settings.ChromeBinary }
+        $caps = @{ browserName = 'chrome'; acceptInsecureCerts = $true; pageLoadStrategy = 'none'
+                   'goog:chromeOptions' = $opt }
+    }
+    $v = Invoke-WD POST '/session' @{ capabilities = @{ alwaysMatch = $caps } } -TimeoutSec 90
+    $script:Drv.Session = $v.sessionId
+}
+
+function Initialize-Browser($Settings) {
+    # 戻り値: 新しいブラウザを起動したら $true（最初のタブをそのまま使える）
+    if ($script:Drv -and $script:Drv.Browser -ne $Settings.Browser) { Stop-Driver }
+    if ($script:Drv -and $script:Drv.Proc.HasExited) { $script:Drv = $null }
+
+    if ($script:Drv -and $script:Drv.Session) {
+        try {
+            $h = @(Invoke-WD GET "$(Get-SessPath)/window/handles" -TimeoutSec 5)
+            if ($h.Count -gt 0) {
+                Invoke-WD POST "$(Get-SessPath)/window" @{ handle = $h[-1] } | Out-Null
+                return $false            # 開いているブラウザを再利用
+            }
+        } catch { }
+        $script:Drv.Session = $null      # ブラウザが閉じられていた
+    }
+
+    if (-not $script:Drv) { Start-Driver $Settings }
+    try {
+        New-WDSession $Settings
+    } catch {
+        # 古いセッションが残っている等 → Driver を再起動して再試行
+        Stop-Driver
+        Start-Driver $Settings
+        New-WDSession $Settings
+    }
+    return $true
+}
+
+# ============================================================ CUCM ログイン
+function Invoke-ClusterLogin($C, $Settings) {
+    $path = if ($C.LoginPath) { $C.LoginPath } else { $Settings.LoginPath }
+    if (-not $path.StartsWith('/')) { $path = '/' + $path }
+    Invoke-WD POST "$(Get-SessPath)/url" @{ url = "https://$($C.Ip)$path" } | Out-Null
+
+    $limit = $Settings.Timeout * 1000
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+
+    # ログイン画面の表示待ち
+    $userEl = $null
+    while ($sw.ElapsedMilliseconds -lt $limit) {
+        try {
+            $u = @(Find-Elements "input[name='j_username']")
+            if ($u.Count -gt 0 -and (Invoke-JS 'return document.readyState') -eq 'complete') { $userEl = $u[0]; break }
+        } catch { }
+        Wait-UI 300
+    }
+    if (-not $userEl) {
+        return [pscustomobject]@{ Ok = $false; Msg = 'ログイン画面が表示されません（IP/URL/到達性を確認）' }
+    }
+    $pwEl = @(Find-Elements "input[name='j_password']")[0]
+
+    # ID / パスワード入力
+    Invoke-WD POST "$(Get-SessPath)/element/$userEl/clear" | Out-Null
+    Invoke-WD POST "$(Get-SessPath)/element/$userEl/value" @{ text = $C.User } | Out-Null
+    Invoke-WD POST "$(Get-SessPath)/element/$pwEl/clear" | Out-Null
+    Invoke-WD POST "$(Get-SessPath)/element/$pwEl/value" @{ text = $C.Password } | Out-Null
+
+    # ログインボタンを押す（見つからなければ Enter）
+    $clicked = $false
+    $btn = @(Find-Elements "form input[type='submit'], form button[type='submit']")
+    if ($btn.Count -gt 0) {
+        try { Invoke-WD POST "$(Get-SessPath)/element/$($btn[0])/click" | Out-Null; $clicked = $true } catch { }
+    }
+    if (-not $clicked) {
+        Invoke-WD POST "$(Get-SessPath)/element/$pwEl/value" @{ text = [string][char]0xE007 } | Out-Null
+    }
+
+    # 画面遷移を待って判定
+    $sw.Restart()
+    $navigated = $false
+    while ($sw.ElapsedMilliseconds -lt $limit) {
+        if (-not $navigated) {
+            try { Invoke-WD GET "$(Get-SessPath)/element/$pwEl/name" -TimeoutSec 5 | Out-Null }
+            catch { if ($_.Exception.Message -like '*stale element*') { $navigated = $true } }
+        }
+        if ($navigated) {
+            try {
+                if ((Invoke-JS 'return document.readyState') -eq 'complete') {
+                    if (@(Find-Elements "input[name='j_password']").Count -eq 0) {
+                        return [pscustomobject]@{ Ok = $true; Msg = 'ログイン成功' }
+                    }
+                    break
+                }
+            } catch { }
+        }
+        Wait-UI 300
+    }
+    try {
+        if (@(Find-Elements "input[name='j_password']").Count -eq 0) {
+            return [pscustomobject]@{ Ok = $true; Msg = 'ログイン成功' }
+        }
+    } catch { }
+    return [pscustomobject]@{ Ok = $false; Msg = 'ログイン画面のまま（ID/パスワード誤りの可能性）' }
+}
+
+# ============================================================ 画面
+$form = New-Object System.Windows.Forms.Form
+$form.Text = $AppTitle
+$form.Size = New-Object System.Drawing.Size(920, 620)
+$form.StartPosition = 'CenterScreen'
+$form.Font = New-Object System.Drawing.Font('Meiryo UI', 9)
+
+# --- 上部：ブラウザ選択 / パスワード表示
+$top = New-Object System.Windows.Forms.FlowLayoutPanel
+$top.Dock = 'Top'; $top.Height = 38; $top.Padding = New-Object System.Windows.Forms.Padding(8, 8, 8, 0)
+$lblBrowser = New-Object System.Windows.Forms.Label
+$lblBrowser.Text = 'ブラウザ:'; $lblBrowser.AutoSize = $true
+$lblBrowser.Margin = New-Object System.Windows.Forms.Padding(0, 4, 4, 0)
+$rbChrome = New-Object System.Windows.Forms.RadioButton
+$rbChrome.Text = 'Chrome'; $rbChrome.AutoSize = $true; $rbChrome.Checked = $true
+$rbFirefox = New-Object System.Windows.Forms.RadioButton
+$rbFirefox.Text = 'Firefox'; $rbFirefox.AutoSize = $true
+$rbFirefox.Margin = New-Object System.Windows.Forms.Padding(3, 3, 24, 3)
+$chkShowPw = New-Object System.Windows.Forms.CheckBox
+$chkShowPw.Text = 'パスワードを表示'; $chkShowPw.AutoSize = $true
+$top.Controls.AddRange(@($lblBrowser, $rbChrome, $rbFirefox, $chkShowPw))
+
+# --- 中央：クラスタ一覧
+$grid = New-Object System.Windows.Forms.DataGridView
+$grid.Dock = 'Fill'
+$grid.AllowUserToAddRows = $false
+$grid.AllowUserToDeleteRows = $false
+$grid.AllowUserToResizeRows = $false
+$grid.RowHeadersVisible = $false
+$grid.SelectionMode = 'FullRowSelect'
+$grid.AutoSizeColumnsMode = 'Fill'
+$grid.BackgroundColor = [System.Drawing.SystemColors]::Window
+
+$colChk = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
+$colChk.Name = 'chk'; $colChk.HeaderText = '選択'; $colChk.FillWeight = 8
+[void]$grid.Columns.Add($colChk)
+foreach ($def in @(@('name', 'クラスタ名', 24), @('ip', 'IP', 16), @('user', 'ログインID', 15),
+                   @('pw', 'Password', 15), @('result', '結果', 30))) {
+    $c = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $c.Name = $def[0]; $c.HeaderText = $def[1]; $c.FillWeight = $def[2]; $c.ReadOnly = $true
+    $c.SortMode = 'NotSortable'
+    [void]$grid.Columns.Add($c)
+}
+
+# --- 下部：ボタン
+$bottom = New-Object System.Windows.Forms.Panel
+$bottom.Dock = 'Bottom'; $bottom.Height = 48
+$bottom.Width = $form.ClientSize.Width   # 右寄せボタンの位置計算用
+function New-Btn([string]$Text, [int]$X, [int]$W = 90) {
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $Text; $b.Location = New-Object System.Drawing.Point($X, 10); $b.Size = New-Object System.Drawing.Size($W, 30)
+    $bottom.Controls.Add($b); return $b
+}
+$btnAll    = New-Btn '全選択' 8
+$btnNone   = New-Btn '全解除' 102
+$btnOpen   = New-Btn '設定ファイルを開く' 220 140
+$btnReload = New-Btn '再読込' 364
+$btnLogin  = New-Object System.Windows.Forms.Button
+$btnLogin.Text = 'ログイン'; $btnLogin.Size = New-Object System.Drawing.Size(140, 34)
+$btnLogin.Anchor = 'Top, Right'
+$btnLogin.Location = New-Object System.Drawing.Point(($bottom.Width - 152), 7)
+$bottom.Controls.Add($btnLogin)
+
+# --- 最下部：ログ
+$logGroup = New-Object System.Windows.Forms.GroupBox
+$logGroup.Text = 'ログ'; $logGroup.Dock = 'Bottom'; $logGroup.Height = 150
+$logBox = New-Object System.Windows.Forms.TextBox
+$logBox.Multiline = $true; $logBox.ReadOnly = $true; $logBox.ScrollBars = 'Vertical'; $logBox.Dock = 'Fill'
+$logBox.BackColor = [System.Drawing.SystemColors]::Window
+$logGroup.Controls.Add($logBox)
+
+# 追加順でドッキング位置が決まる（後に追加したものから外側に配置）
+$form.Controls.Add($grid)
+$form.Controls.Add($bottom)
+$form.Controls.Add($logGroup)
+$form.Controls.Add($top)
+
+# ============================================================ 画面の動作
+function Write-Log([string]$Msg) {
+    $logBox.AppendText("$Msg`r`n")
+}
+
+function Get-PwText([string]$Pw) { if ($chkShowPw.Checked) { $Pw } else { $PwMask } }
+
+function Update-PwColumn {
+    foreach ($row in $grid.Rows) { $row.Cells['pw'].Value = Get-PwText $row.Tag.Password }
+}
+
+function Import-ClusterList {
+    if (-not (Test-Path -LiteralPath $ConfigFile)) {
+        [System.Windows.Forms.MessageBox]::Show("設定ファイルが見つかりません:`n$ConfigFile", $AppTitle, 'OK', 'Error') | Out-Null
+        return
+    }
+    try { $cfg = Read-Config $ConfigFile }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show("設定ファイルの読込に失敗しました:`n$($_.Exception.Message)", $AppTitle, 'OK', 'Error') | Out-Null
+        return
+    }
+    $script:Settings = $cfg.Settings
+    $rbFirefox.Checked = ($cfg.Settings.Browser -eq 'firefox')
+    $rbChrome.Checked  = -not $rbFirefox.Checked
+    $chkShowPw.Checked = $cfg.Settings.ShowPassword
+    $grid.Rows.Clear()
+    foreach ($c in $cfg.Clusters) {
+        $i = $grid.Rows.Add($c.Checked, $c.Name, $c.Ip, $c.User, (Get-PwText $c.Password), '')
+        $grid.Rows[$i].Tag = $c
+    }
+    Write-Log "設定を読み込みました（$($cfg.Clusters.Count) クラスタ）"
+}
+
+function Set-AllChecked([bool]$On) {
+    $grid.EndEdit() | Out-Null
+    foreach ($row in $grid.Rows) { $row.Cells['chk'].Value = $On }
+}
+
+function Set-Busy([bool]$Busy) {
+    foreach ($b in @($btnLogin, $btnReload, $btnAll, $btnNone, $rbChrome, $rbFirefox)) { $b.Enabled = -not $Busy }
+}
+
+$grid.Add_CurrentCellDirtyStateChanged({
+    if ($grid.IsCurrentCellDirty) { $grid.CommitEdit('CurrentCellChange') | Out-Null }
+})
+$grid.Add_ColumnHeaderMouseClick({
+    param($s, $e)
+    if ($e.ColumnIndex -eq 0) {
+        $allOn = $grid.Rows.Count -gt 0
+        foreach ($row in $grid.Rows) { if (-not [bool]$row.Cells['chk'].Value) { $allOn = $false } }
+        Set-AllChecked (-not $allOn)
+    }
+})
+$grid.Add_KeyDown({
+    param($s, $e)
+    if ($e.KeyCode -eq 'Space') {
+        foreach ($row in $grid.SelectedRows) { $row.Cells['chk'].Value = -not [bool]$row.Cells['chk'].Value }
+        $e.Handled = $true
+    }
+})
+
+$chkShowPw.Add_CheckedChanged({ Update-PwColumn })
+$btnAll.Add_Click({ Set-AllChecked $true })
+$btnNone.Add_Click({ Set-AllChecked $false })
+$btnReload.Add_Click({ Import-ClusterList })
+$btnOpen.Add_Click({
+    try { Start-Process notepad.exe -ArgumentList "`"$ConfigFile`"" }
+    catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, $AppTitle) | Out-Null }
+})
+
+$btnLogin.Add_Click({
+    $grid.EndEdit() | Out-Null
+    $targets = @($grid.Rows | Where-Object { [bool]$_.Cells['chk'].Value })
+    if ($targets.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('クラスタを選択してください。', $AppTitle) | Out-Null
+        return
+    }
+    if (-not $script:Settings) { return }
+    $settings = $script:Settings.PSObject.Copy()
+    $settings.Browser = if ($rbFirefox.Checked) { 'firefox' } else { 'chrome' }
+
+    Set-Busy $true
+    try {
+        foreach ($row in $targets) { $row.Cells['result'].Value = '待機中…' }
+        Write-Log "$($settings.Browser) を起動しています…"
+        Wait-UI 50
+        try {
+            $fresh = Initialize-Browser $settings | Select-Object -Last 1
+        } catch {
+            Write-Log "[エラー] ブラウザを起動できません: $($_.Exception.Message)"
+            Write-Log '  → Driver のファイル（win64 版）と、ブラウザとのバージョン一致を確認してください'
+            foreach ($row in $targets) { $row.Cells['result'].Value = '✖ ブラウザ起動失敗' }
+            return
+        }
+
+        $ok = 0; $n = 0
+        foreach ($row in $targets) {
+            $c = $row.Tag
+            $row.Cells['result'].Value = 'ログイン中…'
+            Wait-UI 30
+            try {
+                if (-not ($fresh -and $n -eq 0)) {
+                    $w = Invoke-WD POST "$(Get-SessPath)/window/new" @{ type = 'tab' }
+                    Invoke-WD POST "$(Get-SessPath)/window" @{ handle = $w.handle } | Out-Null
+                }
+                $r = Invoke-ClusterLogin $c $settings
+            } catch {
+                $r = [pscustomobject]@{ Ok = $false; Msg = $_.Exception.Message }
+            }
+            $n++
+            if ($r.Ok) { $ok++ }
+            $row.Cells['result'].Value = $(if ($r.Ok) { '✔ ' } else { '✖ ' }) + $r.Msg
+            Write-Log "$($c.Name) ($($c.Ip)): $($r.Msg)"
+        }
+        Write-Log "完了: $ok/$($targets.Count) 成功"
+    } finally {
+        Set-Busy $false
+    }
+})
+
+$form.Add_FormClosing({
+    # Chrome は detach 指定のため、Driver を止めてもブラウザは残る
+    # Firefox は Driver を止めるとブラウザが閉じることがあるため、そのまま残す
+    if ($script:Drv -and $script:Drv.Browser -eq 'chrome') { Stop-Driver }
+})
+
+$form.Add_Shown({ Import-ClusterList })
+[void]$form.ShowDialog()
