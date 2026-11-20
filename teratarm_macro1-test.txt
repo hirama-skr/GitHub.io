@@ -1,0 +1,74 @@
+; ============================================================
+;  start.ttl : 接続先一覧を表示 → GO で複数台へ一斉ログイン
+;  ・List.txt の内容をリスト表示
+;  ・先頭の「GO!」を選ぶと全台、個別行を選ぶとその1台だけ接続
+;  ・1台ごとに login.ttl を別プロセスで起動（Tera Term 多重起動）
+; ============================================================
+getdir dir                              ; このマクロのフォルダ
+getttdir ttdir                          ; Tera Term のインストール先
+makepath listf dir 'List.txt'
+makepath logdir dir 'log'
+foldercreate logdir                     ; log フォルダ作成（既にあれば何もしない）
+
+; ---- 1回目の読み込み：有効な行（#・空行以外）を数える ----
+fileopen fh listf 0
+n = 0
+while 1
+  filereadln fh line
+  if result break                       ; ファイル末尾で終了
+  strmatch line '^[^#\s]'               ; 先頭が # や空白でなければ有効行
+  if result n = n + 1
+endwhile
+fileclose fh
+if n = 0 then
+  messagebox 'List.txt に接続先がありません。' 'エラー'
+  end
+endif
+
+; ---- 2回目の読み込み：画面に出す一覧を作る ----
+m = n + 1
+strdim items m                          ; [0]=GOボタン行, [1]～[n]=各機器
+sprintf2 s '>>>>>   GO!  全 %d 台に一括接続   <<<<<' n
+items[0] = s
+fileopen fh listf 0
+i = 0
+while i < n
+  filereadln fh line
+  strmatch line '^[^#\s]'
+  if result then
+    i = i + 1
+    strsplit line ',' 7                 ; ホスト名,IP,方式,ユーザ,PW,EnablePW,コマンドファイル
+    sprintf2 s '%02d.  %s   ( %s )   [%s]   %s' i groupmatchstr1 groupmatchstr2 groupmatchstr3 groupmatchstr7
+    items[i] = s
+  endif
+endwhile
+fileclose fh
+
+; ---- 一覧表示（OK=接続 / キャンセル=終了）----
+msg = '接続先を選んで［OK］を押してください。'#13#10'先頭の「GO!」を選ぶと全台へ順番にログインします。'
+listbox msg 'Tera Term 自動ログ取得ツール' items
+sel = result
+if sel < 0 end                          ; キャンセル
+
+; ---- 接続範囲を決める（GO=全台 / それ以外=1台）----
+if sel = 0 then
+  first = 1
+  last = n
+else
+  first = sel
+  last = sel
+endif
+
+; ---- 1台ずつ login.ttl を起動（/V=マクロ窓を非表示, 引数=何台目か）----
+makepath ttpm ttdir 'ttpmacro.exe'
+makepath loginf dir 'login.ttl'
+for i first last
+  sprintf2 cmd '"%s" /V "%s" %d' ttpm loginf i
+  exec cmd
+  mpause 1500                           ; 同時接続の集中を避ける（30台で約45秒）
+endfor
+
+c = last - first + 1
+sprintf2 s '%d 台の接続を開始しました。'#13#10'ログは log フォルダに保存されます。' c
+messagebox s '開始'
+end
